@@ -1,0 +1,242 @@
+name: SDL2 Audio
+
+on:
+  push:
+    paths-ignore:
+      - '.{gitattributes,gitignore,travis.yml}'
+      - '*.md,appveyor.yml,README'
+  pull_request:
+    paths-ignore:
+      - '.{gitattributes,gitignore,travis.yml}'
+      - '*.md,appveyor.yml,README'
+  workflow_dispatch:
+
+jobs:
+
+  Linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: GCC
+            arch: x64
+          - cc: GCC
+            arch: x86
+          - cc: Clang
+            arch: x64
+          - cc: Clang
+            arch: x86
+    name: Linux / ${{ matrix.cc }} / ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Get build dependencies and arrange the environment
+        run: |
+          git clone --depth 1 https://github.com/mupen64plus/mupen64plus-core.git ../mupen64plus-core
+          echo ""
+          echo "G_REV=$(git rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+          if [[ "${{ matrix.arch }}" == "x86" ]]; then sudo dpkg --add-architecture i386; fi
+          sudo apt-get update
+          sudo apt-mark hold grub-common grub-efi-amd64-bin python3 python3-apt shim-signed
+          sudo apt-get -y install build-essential cmake git nasm ninja-build pkg-config libsdl2-dev
+          if [[ "${{ matrix.arch }}" == "x86" ]]; then
+            HOTFIX_I386="libatomic1:i386 libgcc-s1:i386 libstdc++6:i386"
+            sudo apt-get --reinstall -y install crossbuild-essential-i386 g++-i686-linux-gnu gcc-i686-linux-gnu libsdl2-dev:i386 ${HOTFIX_I386}
+          fi
+          sudo ldconfig
+      - name: Build and related stuff, backup binaries
+        run: |
+          CC="gcc"
+          CXX="g++"
+          CPU_TUNE="-march=nocona"
+          if [[ "${{ matrix.arch }}" == "x86" ]]; then
+            CC="i686-linux-gnu-gcc"
+            CXX="i686-linux-gnu-g++"
+            CPU_TUNE="-m32 -march=pentium4"
+          fi
+          if [[ "${{ matrix.cc }}" != "GCC" ]]; then
+            CC="clang"
+            CXX="clang++"
+          fi
+          ${CC} --version
+          echo ""
+          mkdir -p build pkg/usr/local/lib/mupen64plus
+          chmod -R 755 build pkg
+          cd build
+          cmake -DCMAKE_C_COMPILER="${CC}" -DCMAKE_C_FLAGS="${CPU_TUNE}" -DCMAKE_BUILD_TYPE="Release" -G "Ninja" ..
+          echo ""
+          cmake --build . -j2
+          echo ""
+          chmod 644 *.so
+          cp *.so ../pkg/usr/local/lib/mupen64plus/
+          cd ../pkg
+          ls -gG usr/local/lib/mupen64plus/*.so
+          echo ""
+          ldd usr/local/lib/mupen64plus/simple64-audio-sdl2.so
+          echo ""
+          tar --owner=0 --group=0 --mode='og-w' -czf "simple64-audio-sdl2-linux-${{ matrix.arch }}-g${{ env.G_REV }}.tar.gz" usr
+      - name: Upload artifact
+        if: matrix.cc == 'GCC'
+        uses: actions/upload-artifact@v7
+        with:
+          name: simple64-audio-sdl2-linux-${{ matrix.arch }}-g${{ env.G_REV }}
+          path: pkg/*.tar.gz
+
+  Windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: GCC
+            arch: x64
+            cross: x86_64
+            env: MINGW64
+          - cc: GCC
+            arch: x86
+            cross: i686
+            env: MINGW32
+          - cc: GCC
+            arch: x64
+            cross: ucrt-x86_64
+            env: UCRT64
+          - cc: Clang
+            arch: x64
+            cross: clang-x86_64
+            env: CLANG64
+    name: Windows ${{ matrix.arch }} / MSYS2 ${{ matrix.env }} ${{ matrix.cc }}
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.env }}
+          update: true
+          install: >-
+            git
+            libtool
+            mingw-w64-${{ matrix.cross }}-toolchain
+            mingw-w64-${{ matrix.cross }}-cmake
+            mingw-w64-${{ matrix.cross }}-ninja
+            mingw-w64-${{ matrix.cross }}-ntldd
+            mingw-w64-${{ matrix.cross }}-SDL2
+      - name: Build and related stuff, backup binaries
+        run: |
+          git clone --depth 1 https://github.com/mupen64plus/mupen64plus-core.git ../mupen64plus-core
+          echo ""
+          echo "G_REV=$(git rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+          echo "ENV_MSYS=$(echo "${{ matrix.env }}" | tr '[A-Z]' '[a-z]')" >> "${GITHUB_ENV}"
+          CC="gcc"
+          CXX="g++"
+          CPU_TUNE="-march=nocona"
+          if [[ "${{ matrix.arch }}" == "x86" ]]; then
+            CPU_TUNE="-m32 -march=pentium4"
+          fi
+          if [[ "${{ matrix.cc }}" != "GCC" ]]; then
+            CC="clang"
+            CXX="clang++"
+          fi
+          ${CC} --version
+          echo ""
+          mkdir -p build pkg
+          chmod -R 755 build pkg
+          cd build
+          cmake -DCMAKE_C_COMPILER="${CC}" -DCMAKE_C_FLAGS="${CPU_TUNE}" -DCMAKE_BUILD_TYPE="Release" -G "Ninja" ..
+          echo ""
+          cmake --build . -j2
+          echo ""
+          chmod 644 *.dll
+          cp *.dll ../pkg/
+          cd ../pkg
+          ls -gG *.dll
+          echo ""
+          ntldd -R simple64-audio-sdl2.dll > ldd.log
+          cat ldd.log
+      - name: Backup dependencies, etc...
+        run: |
+          DEPS="$(LC_ALL=C grep "${{ env.ENV_MSYS }}" pkg/ldd.log | tr -s '\t' ' ' | sort | cut -d ' ' -f4 | tr '\\' '/' | tr -d ':')"
+          rm -f pkg/ldd.log
+          if [[ "${DEPS}" == "" ]]; then
+            echo ":: None..."
+            exit 0
+          fi
+          for LIB in ${DEPS}; do
+            echo ":: Copying ${LIB##*/}"
+            cp "/${LIB}" pkg/
+          done
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: simple64-audio-sdl2-msys2-${{ env.ENV_MSYS }}-${{ matrix.arch }}-g${{ env.G_REV }}
+          path: pkg/*
+
+  Nightly-build:
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'ci-smp64'
+    needs: [Linux, Windows]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: binaries
+      - name: Get some tools
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install hashdeep
+      - name: Creating new artifacts and update nightly-build
+        run: |
+          REPO="${PWD##*/}"
+          mkdir pkg
+          cd binaries
+          for BIN in *; do
+            cd "${BIN}"
+            case "${BIN}" in
+              *linux* )
+                echo ":: Recovering ${BIN}.tar.gz"
+                mv *.tar.gz ../../pkg/
+                ;;
+              * )
+                echo ":: Creating ${BIN}.zip"
+                zip -r "../../pkg/${BIN}.zip" *
+                ;;
+            esac
+            cd ..
+          done
+          cd ../pkg
+          echo ""
+          for ZIP in *; do
+            ls -gG ${ZIP}
+            tigerdeep -lz ${ZIP} >> ../${REPO}.tiger.txt
+            sha256sum ${ZIP} >> ../${REPO}.sha256.txt
+            sha512sum ${ZIP} >> ../${REPO}.sha512.txt
+            b2sum ${ZIP} >> ../${REPO}.blake2.txt
+          done
+          mv ../${REPO}.*.txt .
+          echo ""
+          for HASH in tiger sha256 sha512 blake2; do
+            echo "${HASH}:" | tr '[a-z]' '[A-Z]'
+            cat *.${HASH}.txt
+            echo ""
+          done
+          WORKFLOW_REV="$(git rev-parse HEAD)"
+          echo "WORKFLOW_REV=${WORKFLOW_REV}" >> "${GITHUB_ENV}"
+          git pull
+          CURRENT_REV="$(git rev-parse HEAD)"
+          echo "CURRENT_REV=${CURRENT_REV}" >> "${GITHUB_ENV}"
+          if [[ "${WORKFLOW_REV}" == "${CURRENT_REV}" ]]; then
+            git tag -f nightly-gen-smp64
+            git push -f origin nightly-gen-smp64
+          fi
+      - name: Nightly-build
+        if: ${{ env.WORKFLOW_REV == env.CURRENT_REV }}
+        uses: ncipollo/release-action@v1
+        with:
+          prerelease: true
+          allowUpdates: true
+          removeArtifacts: true
+          replacesArtifacts: false
+          tag: nightly-gen-smp64
+          artifacts: pkg/*
